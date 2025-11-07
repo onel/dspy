@@ -21,11 +21,18 @@ field_header_pattern = re.compile(r"\[\[ ## (\w+) ## \]\]")
 
 
 class FieldInfoWithName(NamedTuple):
+    """Pairs a field name with its Pydantic FieldInfo metadata."""
     name: str
     info: FieldInfo
 
 
 class ChatAdapter(Adapter):
+    """Adapter that formats DSPy signatures as chat-based prompts with field markers.
+    
+    This adapter structures prompts using special markers `[[ ## field_name ## ]]` to delimit
+    input and output fields. It supports fallback to JSONAdapter when parsing fails or when
+    the language model doesn't follow the expected format.
+    """
     def __init__(
         self,
         callbacks=None,
@@ -33,6 +40,14 @@ class ChatAdapter(Adapter):
         native_response_types=None,
         use_json_adapter_fallback: bool = True,
     ):
+        """Initialize the ChatAdapter with optional JSONAdapter fallback.
+        
+        Args:
+            callbacks: List of callback functions for monitoring and logging.
+            use_native_function_calling: Whether to enable native function calling.
+            native_response_types: List of types to handle via native LM features.
+            use_json_adapter_fallback: Whether to automatically fall back to JSONAdapter on errors.
+        """
         super().__init__(
             callbacks=callbacks,
             use_native_function_calling=use_native_function_calling,
@@ -48,6 +63,19 @@ class ChatAdapter(Adapter):
         demos: list[dict[str, Any]],
         inputs: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        """Execute the adapter pipeline with automatic fallback to JSONAdapter on errors.
+        
+        Attempts to format and parse using ChatAdapter's field marker format. If any exception
+        occurs (except ContextWindowExceededError), falls back to JSONAdapter unless disabled
+        or already using JSONAdapter.
+        
+        Returns:
+            List of dictionaries containing parsed output fields from the language model response.
+            
+        Raises:
+            ContextWindowExceededError: When the input exceeds the model's context window.
+            Exception: Any exception from the parent class if fallback is disabled or unavailable.
+        """
         try:
             return super().__call__(lm, lm_kwargs, signature, demos, inputs)
         except Exception as e:
@@ -72,6 +100,15 @@ class ChatAdapter(Adapter):
         demos: list[dict[str, Any]],
         inputs: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        """Async version of __call__ with the same fallback behavior.
+        
+        Returns:
+            List of dictionaries containing parsed output fields from the language model response.
+            
+        Raises:
+            ContextWindowExceededError: When the input exceeds the model's context window.
+            Exception: Any exception from the parent class if fallback is disabled or unavailable.
+        """
         try:
             return await super().acall(lm, lm_kwargs, signature, demos, inputs)
         except Exception as e:
@@ -89,21 +126,31 @@ class ChatAdapter(Adapter):
             return await JSONAdapter().acall(lm, lm_kwargs, signature, demos, inputs)
 
     def format_field_description(self, signature: type[Signature]) -> str:
+        """Format the field descriptions as separate input and output sections.
+        
+        Returns:
+            A string containing formatted descriptions of all input and output fields.
+        """
         return (
             f"Your input fields are:\n{get_field_description_string(signature.input_fields)}\n"
             f"Your output fields are:\n{get_field_description_string(signature.output_fields)}"
         )
 
     def format_field_structure(self, signature: type[Signature]) -> str:
-        """
-        `ChatAdapter` requires input and output fields to be in their own sections, with section header using markers
-        `[[ ## field_name ## ]]`. An arbitrary field `completed` ([[ ## completed ## ]]) is added to the end of the
-        output fields section to indicate the end of the output fields.
+        """Format the expected structure using field markers like [[ ## field_name ## ]].
+        
+        Creates a template showing how input and output fields should be formatted, with each
+        field wrapped in markers. Adds a `[[ ## completed ## ]]` marker at the end to signal
+        completion of the output section.
+        
+        Returns:
+            A string template showing the expected structure with field markers.
         """
         parts = []
         parts.append("All interactions will be structured in the following way, with the appropriate values filled in.")
 
         def format_signature_fields_for_instructions(fields: dict[str, FieldInfo]):
+            """Convert signature fields into formatted field markers with type information."""
             return self.format_field_with_value(
                 fields_with_values={
                     FieldInfoWithName(name=field_name, info=field_info): translate_field_type(field_name, field_info)
@@ -117,6 +164,11 @@ class ChatAdapter(Adapter):
         return "\n\n".join(parts).strip()
 
     def format_task_description(self, signature: type[Signature]) -> str:
+        """Format the task description from the signature's instructions.
+        
+        Returns:
+            A string containing the formatted task description with proper indentation.
+        """
         instructions = textwrap.dedent(signature.instructions)
         objective = ("\n" + " " * 8).join([""] + instructions.splitlines())
         return f"In adhering to this structure, your objective is: {objective}"
@@ -129,6 +181,15 @@ class ChatAdapter(Adapter):
         suffix: str = "",
         main_request: bool = False,
     ) -> str:
+        """Format user message content with input field values wrapped in markers.
+        
+        Constructs a message containing all input fields formatted as `[[ ## field_name ## ]]`
+        followed by the field value. Optionally includes output format requirements when this
+        is the main request.
+        
+        Returns:
+            A formatted string containing all input fields with their values and optional format requirements.
+        """
         messages = [prefix]
         for k, v in signature.input_fields.items():
             if k in inputs:
@@ -150,19 +211,13 @@ class ChatAdapter(Adapter):
         In chat-based interactions, language models may lose track of the required output format
         as the conversation context grows longer. This method generates a concise reminder of
         the expected output structure that can be included in user messages.
-
-        Args:
-            signature (Type[Signature]): The DSPy signature defining the expected input/output fields.
-
+        
         Returns:
-            str: A simplified description of the required output format.
-
-        Note:
-            This is a more lightweight version of `format_field_structure` specifically designed
-            for inline reminders within chat messages.
+            A string describing the expected output format with field markers and type requirements.
         """
 
         def type_info(v):
+            """Generate type requirement text for non-string fields."""
             if v.annotation is not str:
                 return f" (must be formatted as a valid Python {get_annotation_name(v.annotation)})"
             else:
@@ -179,6 +234,17 @@ class ChatAdapter(Adapter):
         outputs: dict[str, Any],
         missing_field_message=None,
     ) -> str:
+        """Format assistant message content with output field values wrapped in markers.
+        
+        Constructs a message containing all output fields formatted as `[[ ## field_name ## ]]`
+        followed by the field value. Ends with the completion marker `[[ ## completed ## ]]`.
+        
+        Args:
+            missing_field_message: Optional message to use when an output field value is missing.
+            
+        Returns:
+            A formatted string containing all output fields with their values and the completion marker.
+        """
         assistant_message_content = self.format_field_with_value(
             {
                 FieldInfoWithName(name=k, info=v): outputs.get(k, missing_field_message)
@@ -189,6 +255,18 @@ class ChatAdapter(Adapter):
         return assistant_message_content
 
     def parse(self, signature: type[Signature], completion: str) -> dict[str, Any]:
+        """Parse the LM completion by extracting content between field markers.
+        
+        Scans the completion for field markers `[[ ## field_name ## ]]` and extracts the content
+        following each marker until the next marker. Validates that all expected output fields
+        are present and parses each field value according to its type annotation.
+        
+        Returns:
+            A dictionary mapping output field names to their parsed values.
+            
+        Raises:
+            AdapterParseError: If parsing fails for any field or if expected fields are missing.
+        """
         sections = [(None, [])]
 
         for line in completion.splitlines():
@@ -226,17 +304,13 @@ class ChatAdapter(Adapter):
         return fields
 
     def format_field_with_value(self, fields_with_values: dict[FieldInfoWithName, Any]) -> str:
-        """
-        Formats the values of the specified fields according to the field's DSPy type (input or output),
-        annotation (e.g. str, int, etc.), and the type of the value itself. Joins the formatted values
-        into a single string, which is is a multiline string if there are multiple fields.
-
-        Args:
-            fields_with_values: A dictionary mapping information about a field to its corresponding
-                value.
-
+        """Format multiple fields with their values, each wrapped in field markers.
+        
+        Converts a dictionary of fields and values into a multi-line string where each field
+        is formatted as `[[ ## field_name ## ]]` followed by the formatted field value.
+        
         Returns:
-            The joined formatted values of the fields, represented as a string
+            A formatted string with all fields and their values separated by field markers.
         """
         output = []
         for field, field_value in fields_with_values.items():
@@ -252,12 +326,14 @@ class ChatAdapter(Adapter):
         inputs: dict[str, Any],
         outputs: dict[str, Any],
     ) -> dict[str, list[Any]]:
-        """
-        Format the call data into finetuning data according to the OpenAI API specifications.
-
-        For the chat adapter, this means formatting the data as a list of messages, where each message is a dictionary
-        with a "role" and "content" key. The role can be "system", "user", or "assistant". Then, the messages are
-        wrapped in a dictionary with a "messages" key.
+        """Format the call data into OpenAI-compatible fine-tuning format.
+        
+        Converts the signature, demos, inputs, and outputs into a list of chat messages with
+        roles (system, user, assistant). The system and user messages are generated from the
+        format method, and the assistant message is generated from the outputs.
+        
+        Returns:
+            A dictionary with a "messages" key containing the formatted chat messages.
         """
         system_user_messages = self.format(  # returns a list of dicts with the keys "role" and "content"
             signature=signature, demos=demos, inputs=inputs
