@@ -32,6 +32,32 @@ class ChatAdapter(Adapter):
     This adapter structures prompts using special markers `[[ ## field_name ## ]]` to delimit
     input and output fields. It supports fallback to JSONAdapter when parsing fails or when
     the language model doesn't follow the expected format.
+    
+    Example:
+        ```python
+        import dspy
+        from dspy.adapters.chat_adapter import ChatAdapter
+        
+        # Define a signature for your task
+        class QA(dspy.Signature):
+            '''Answer questions with short factoid answers.'''
+            question: str = dspy.InputField()
+            answer: str = dspy.OutputField()
+        
+        # Initialize the adapter
+        adapter = ChatAdapter(use_json_adapter_fallback=True)
+        
+        # Use with a language model
+        lm = dspy.LM(model='gpt-4')
+        result = adapter(
+            lm=lm,
+            lm_kwargs={},
+            signature=QA,
+            demos=[],  # Optional demonstration examples
+            inputs={"question": "What is the capital of France?"}
+        )
+        # result will be a list containing: [{"answer": "Paris"}]
+        ```
     """
     def __init__(
         self,
