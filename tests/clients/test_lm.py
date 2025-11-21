@@ -298,6 +298,7 @@ def test_reasoning_model_token_parameter():
         ("openai/gpt-5", True),
         ("openai/gpt-5-mini", True),
         ("openai/gpt-5-nano", True),
+        ("azure/gpt-5-chat", False),  # gpt-5-chat is NOT a reasoning model
         ("openai/gpt-4", False),
         ("anthropic/claude-2", False),
     ]
@@ -318,7 +319,7 @@ def test_reasoning_model_token_parameter():
             assert lm.kwargs["max_tokens"] == 1000
 
 
-@pytest.mark.parametrize("model_name", ["openai/o1", "openai/gpt-5-nano"])
+@pytest.mark.parametrize("model_name", ["openai/o1", "openai/gpt-5-nano", "openai/gpt-5-mini"])
 def test_reasoning_model_requirements(model_name):
     # Should raise assertion error if temperature or max_tokens requirements not met
     with pytest.raises(
@@ -345,6 +346,21 @@ def test_reasoning_model_requirements(model_name):
     )
     assert lm.kwargs["temperature"] is None
     assert lm.kwargs["max_completion_tokens"] is None
+
+
+def test_gpt_5_chat_not_reasoning_model():
+    """Test that gpt-5-chat is NOT treated as a reasoning model."""
+    # Should NOT raise validation error - gpt-5-chat is not a reasoning model
+    lm = dspy.LM(
+        model="openai/gpt-5-chat",
+        temperature=0.7,  # Can be any value
+        max_tokens=1000,  # Can be any value
+    )
+    # Should use max_tokens, not max_completion_tokens
+    assert "max_completion_tokens" not in lm.kwargs
+    assert "max_tokens" in lm.kwargs
+    assert lm.kwargs["max_tokens"] == 1000
+    assert lm.kwargs["temperature"] == 0.7
 
 
 def test_dump_state():
@@ -607,6 +623,67 @@ def test_responses_api_tool_calls(litellm_test_server):
         assert dspy_responses.call_args.kwargs["model"] == "openai/dspy-test-model"
 
 
+def test_reasoning_effort_responses_api():
+    """Test that reasoning_effort gets normalized to reasoning format for Responses API."""
+    with mock.patch("litellm.responses") as mock_responses:
+        # OpenAI model with Responses API - should normalize
+        lm = dspy.LM(
+            model="openai/gpt-5", model_type="responses", reasoning_effort="low", max_tokens=16000, temperature=1.0
+        )
+        lm("openai query")
+        call_kwargs = mock_responses.call_args.kwargs
+        assert "reasoning_effort" not in call_kwargs
+        assert call_kwargs["reasoning"] == {"effort": "low", "summary": "auto"}
+
+
+def test_call_reasoning_model_with_chat_api():
+    """Test that Chat API properly handles reasoning models and returns data in correct format."""
+    # Create message with reasoning_content attribute
+    message = Message(content="The answer is 4", role="assistant")
+    # Add reasoning_content attribute
+    message.reasoning_content = "Step 1: I need to add 2 + 2\nStep 2: 2 + 2 = 4\nTherefore, the answer is 4"
+
+    # Create choice with the message
+    mock_choice = Choices(message=message)
+
+    # Mock response with reasoning content for chat completion
+    mock_response = ModelResponse(
+        choices=[mock_choice],
+        model="anthropic/claude-3-7-sonnet-20250219",
+        usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+    )
+
+    with mock.patch("litellm.completion", return_value=mock_response) as mock_completion:
+        with mock.patch("litellm.supports_reasoning", return_value=True):
+            # Create reasoning model with chat API
+            lm = dspy.LM(
+                model="anthropic/claude-3-7-sonnet-20250219",
+                model_type="chat",
+                temperature=1.0,
+                max_tokens=16000,
+                reasoning_effort="low",
+                cache=False,
+            )
+
+            # Test the call
+            result = lm("What is 2 + 2?")
+
+            # Verify the response format
+            assert isinstance(result, list)
+            assert len(result) == 1
+            assert isinstance(result[0], dict)
+            assert "text" in result[0]
+            assert "reasoning_content" in result[0]
+            assert result[0]["text"] == "The answer is 4"
+            assert "Step 1" in result[0]["reasoning_content"]
+
+            # Verify mock was called with correct parameters
+            mock_completion.assert_called_once()
+            call_kwargs = mock_completion.call_args.kwargs
+            assert call_kwargs["model"] == "anthropic/claude-3-7-sonnet-20250219"
+            assert call_kwargs["reasoning_effort"] == "low"
+
+
 def test_api_key_not_saved_in_json():
     lm = dspy.LM(
         model="openai/gpt-4o-mini",
@@ -698,6 +775,103 @@ def test_responses_api_converts_images_correctly():
     assert len(content) == 1
     assert content[0]["type"] == "input_image"
     assert content[0]["image_url"] == "https://example.com/image.jpg"
+
+
+def test_responses_api_converts_files_correctly():
+    from dspy.clients.lm import _convert_chat_request_to_responses_request
+
+    # Test with file data (base64 encoded)
+    request_with_file = {
+        "model": "openai/gpt-5-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Analyze this file"},
+                    {
+                        "type": "file",
+                        "file": {
+                            "file_data": "data:text/plain;base64,SGVsbG8gV29ybGQ=",
+                            "filename": "test.txt",
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    result = _convert_chat_request_to_responses_request(request_with_file)
+
+    assert "input" in result
+    assert len(result["input"]) == 1
+    assert result["input"][0]["role"] == "user"
+
+    content = result["input"][0]["content"]
+    assert len(content) == 2
+
+    # First item should be text converted to input_text format
+    assert content[0]["type"] == "input_text"
+    assert content[0]["text"] == "Analyze this file"
+
+    # Second item should be converted to input_file format
+    assert content[1]["type"] == "input_file"
+    assert content[1]["file_data"] == "data:text/plain;base64,SGVsbG8gV29ybGQ="
+    assert content[1]["filename"] == "test.txt"
+
+    # Test with file_id
+    request_with_file_id = {
+        "model": "openai/gpt-5-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "file": {
+                            "file_id": "file-abc123",
+                            "filename": "document.pdf",
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    result = _convert_chat_request_to_responses_request(request_with_file_id)
+
+    content = result["input"][0]["content"]
+    assert len(content) == 1
+    assert content[0]["type"] == "input_file"
+    assert content[0]["file_id"] == "file-abc123"
+    assert content[0]["filename"] == "document.pdf"
+
+    # Test with all file fields
+    request_with_all_fields = {
+        "model": "openai/gpt-5-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "file": {
+                            "file_data": "data:application/pdf;base64,JVBERi0xLjQ=",
+                            "file_id": "file-xyz789",
+                            "filename": "report.pdf",
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    result = _convert_chat_request_to_responses_request(request_with_all_fields)
+
+    content = result["input"][0]["content"]
+    assert content[0]["type"] == "input_file"
+    assert content[0]["file_data"] == "data:application/pdf;base64,JVBERi0xLjQ="
+    assert content[0]["file_id"] == "file-xyz789"
+    assert content[0]["filename"] == "report.pdf"
 
 
 def test_responses_api_with_image_input():
